@@ -55,6 +55,7 @@ enum ClientIdentError {
   InvalidByte,
   AlreadyExists,
   HostNotConnected,
+  FailedToWrite,
 }
 
 impl Display for ClientIdentError {
@@ -63,6 +64,7 @@ impl Display for ClientIdentError {
       ClientIdentError::InvalidByte => "Invalid byte received for client type",
       ClientIdentError::AlreadyExists => "Host with different address already exists",
       ClientIdentError::HostNotConnected => "Host is not connected yet",
+      ClientIdentError::FailedToWrite => "Failed to write to host",
     })
   }
 }
@@ -96,7 +98,11 @@ pub fn handle(client: (TcpStream, SocketAddr)) -> Result<(), Box<dyn Error>> {
         Err(ClientIdentError::AlreadyExists)?;
       }
       stream.write_all(&[1u8; 1])?;
-      handle_host(stream)?;
+      let res = handle_host(stream);
+      *HOST_CHANNEL.lock().expect("Mutex got poisoned") = None;
+      if res.is_err() {
+        return res;
+      }
     }
     ClientType::Client => match *HOST_CHANNEL.lock().expect("Mutex got poisoned") {
       Some(ref sender) => {
@@ -118,23 +124,27 @@ fn handle_host(mut stream: TcpStream) -> Result<(), Box<dyn Error>> {
   *HOST_CHANNEL.lock().expect("Mutex got poisoned") = Some(sender);
   let mut buf = [0u8; 1];
 
-  loop {
-    stream.read_exact(&mut buf)?;
+  while stream.read_exact(&mut buf).is_ok() && buf[0] != 2 {
     match buf[0] {
       0 => continue,
       1 => {}
-      _ => {
-        *HOST_CHANNEL.lock().expect("Mutex got poisoned") = None;
-        break;
-      }
+      _ => return Err(Box::new(ClientIdentError::InvalidByte)),
     }
-    let command: [u8; 16] = receiver.recv().expect("Sender disconnected").into();
+
+    let command: [u8; 16] = match receiver.try_recv() {
+      Ok(command) => command.into(),
+      Err(mpsc::TryRecvError::Empty) => {
+        stream.write_all(&[0])?;
+        continue;
+      }
+      _ => unreachable!("Sender disconnected"),
+    };
+    stream.write_all(&[1])?;
     if stream.write_all(&command).is_err() {
-      *HOST_CHANNEL.lock().expect("Mutex got poisoned") = None;
-      break;
+      return Err(Box::new(ClientIdentError::FailedToWrite));
     }
   }
-
+  stream.write_all(&[2])?;
   Ok(())
 }
 
